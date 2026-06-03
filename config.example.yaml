@@ -1,0 +1,33 @@
+# DeepX 模型配置文件
+# 路径: ~/.deepx/model.yaml
+# 支持 ${ENV_VAR} 从环境变量读取
+# 注释掉的值使用内置默认值
+
+flash:
+  base_url: https://api.deepseek.com
+  model: deepseek-chat-v3-20250314
+  api_key: ${DEEPX_API_KEY}
+  context_window: 1000000
+  max_tokens: 384000
+  input_price: 0.27
+  output_price: 1.1
+  cache_discount: 0.1
+
+pro:
+  base_url: https://api.deepseek.com
+  model: deepseek-reasoner-v2-20250601
+  api_key: ${DEEPX_API_KEY}
+  context_window: 1000000
+  max_tokens: 384000
+  reasoning_effort: medium
+  input_price: 0.27
+  output_price: 1.1
+  cache_discount: 0.1
+
+# Web dashboard
+web:
+  enabled: true
+  port: 0  # 0 = 随机端口
+
+# Agent 模式
+default_mode: review  # auto / review / plan
