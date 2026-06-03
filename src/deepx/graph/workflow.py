@@ -1,21 +1,24 @@
 """
-LangGraph workflow compiler for DeepX.
+LangGraph workflow for DeepX — streaming-ready.
 
-Builds the complete ReAct loop with:
-  START → agent → [tools / plan / compress / model_switch / END]
-              ↑___________________________|
+Uses two streaming layers:
+  1. on_chain_stream events → LLM tokens (built-in, works reliably)
+  2. on_custom_event events → tool calls, routing, usage (custom emits)
 
-Key design:
-- agent_node: LLM call → response + tool_calls
-- tools_node: execute tools → results → back to agent
-- Each node sets state["next_node"] to control routing
+Usage:
+  async for event in app.astream_events(input=state, config={...}):
+      if event["event"] == "on_chain_stream":
+          # LLM token from message chunk
+          content = event["data"]["chunk"].content
+      elif event["event"] == "on_custom_event":
+          # Custom event from writer()
+          data = event["data"]  # tool_call, routing, usage, etc.
 """
 from __future__ import annotations
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from deepx.graph.state import DeepXState, initial_state
 from deepx.graph.edges import decide_next
 from deepx.graph.nodes import (
     agent_node,
@@ -25,23 +28,12 @@ from deepx.graph.nodes import (
     subagents_node,
     tools_node,
 )
+from deepx.graph.state import DeepXState
 
 
 def build_workflow(session_id: str):
-    """
-    Build and compile the DeepX LangGraph workflow.
-
-    Graph structure:
-        START → agent → [conditional on next_node]
-          ├─ "tools"  → tools  → agent
-          ├─ "plan"   → plan   → subagents → agent
-          ├─ "compress" → compress → agent
-          ├─ "model_switch" → model_switch → agent
-          └─ "end" → END
-    """
     workflow = StateGraph(DeepXState)
 
-    # ── Nodes ────────────────────────────────────────────────────────────────
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", tools_node)
     workflow.add_node("plan", plan_node)
@@ -49,25 +41,19 @@ def build_workflow(session_id: str):
     workflow.add_node("compress", compress_node)
     workflow.add_node("model_switch", model_switch_node)
 
-    # ── Edges ────────────────────────────────────────────────────────────────
-    # Entry point
     workflow.add_edge(START, "agent")
-
-    # Fixed edges: after these nodes, always return to agent to continue
     workflow.add_edge("tools", "agent")
     workflow.add_edge("subagents", "agent")
     workflow.add_edge("compress", "agent")
     workflow.add_edge("model_switch", "agent")
-    workflow.add_edge("plan", "subagents")  # plan → parallel sub-agents
+    workflow.add_edge("plan", "subagents")
 
-    # Conditional edge: agent decides where to go next
-    # Returns: "tools" | "agent" | "plan" | "compress" | "model_switch" | "end"
     workflow.add_conditional_edges(
         "agent",
         decide_next,
         {
             "tools": "tools",
-            "agent": "agent",        # shouldn't happen from agent, but handled
+            "agent": "agent",
             "plan": "plan",
             "compress": "compress",
             "model_switch": "model_switch",
@@ -75,17 +61,29 @@ def build_workflow(session_id: str):
         },
     )
 
-    # ── Compile ──────────────────────────────────────────────────────────────
     checkpointer = MemorySaver()
     app = workflow.compile(checkpointer=checkpointer)
     return app
 
 
 def get_initial_state(session_id: str) -> DeepXState:
-    """Get initial state for a new session."""
-    state = initial_state(session_id)
+    state = DeepXState(
+        messages=[],
+        model="flash",
+        next_node=None,
+        context_budget=200_000,
+        compress_triggered=False,
+        session_id=session_id,
+        round=0,
+        total_input_tokens=0,
+        total_output_tokens=0,
+        total_cache_hits=0,
+    )
     state["_mode"] = "review"
     state["_total_input_tokens"] = 0
     state["_total_output_tokens"] = 0
     state["_total_cache_hits"] = 0
     return state
+
+
+__all__ = ["build_workflow", "get_initial_state"]

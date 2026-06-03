@@ -13,6 +13,7 @@ from textual.widgets import Input
 
 from deepx.agent.runner import AgentRunner, StreamDelta
 from deepx.config.settings import get_settings
+from deepx.graph import build_workflow, get_initial_state
 from deepx.mcp.manager import Manager
 from deepx.session.manager import SessionManager
 from deepx.session.store import SessionStore
@@ -71,17 +72,22 @@ class DeepXTUI(App):
         self.message_list = MessageList()
         self.token_panel = TokenPanel()
 
-        # Session manager (persistence)
+        # Session store + manager (persistence)
         self.session_store = SessionStore(workspace=str(self.workspace))
         self.session_manager = SessionManager(workspace=str(self.workspace))
 
-        # Agent runner (handles LLM streaming + tool execution)
-        self.runner = AgentRunner(workspace=str(self.workspace), session_store=self.session_store)
+        # LangGraph workflow (streaming via astream + astream_events)
+        self._workflow = build_workflow(self.session_id)
+        self._app_state = get_initial_state(self.session_id)
+        self._app_state["_mode"] = self._mode
 
-        # Load existing history if any
+        # Load existing history into workflow state
         history = self.session_manager.history
         if history:
-            self.runner.load_history(history)
+            self._app_state["messages"] = history
+
+        # Agent runner (for /run subprocess executor)
+        self.runner = AgentRunner(workspace=str(self.workspace), session_store=self.session_store)
 
         # MCP manager
         self.mcp_manager = Manager()
@@ -153,13 +159,17 @@ class DeepXTUI(App):
         self._usage_input = 0
         self._usage_output = 0
         self._usage_cache = 0
-        self.runner.reset()
+        self._app_state["messages"] = []
+        self._app_state["_total_input_tokens"] = 0
+        self._app_state["_total_output_tokens"] = 0
+        self._app_state["_total_cache_hits"] = 0
         self.session_manager.clear()
         self.notify("Cleared")
 
     def action_new_conv(self) -> None:
         self.message_list.clear()
-        self.runner.reset()
+        self._app_state = get_initial_state(self.session_id)
+        self._app_state["_mode"] = self._mode
         self.session_manager.new_conversation()
         self._streaming = False
         self._streaming_msg_id = None
@@ -167,9 +177,8 @@ class DeepXTUI(App):
         self.notify("New conversation")
 
     def action_save(self) -> None:
-        # Persist current conversation history
         self.session_manager.store.save_history(
-            self.runner.get_history(),
+            self._app_state.get("messages", []),
             self.session_manager.current_conv_id,
         )
         self.notify("Session saved")
@@ -258,12 +267,19 @@ class DeepXTUI(App):
         self.message_list.add_message("user", user_input)
         asyncio.get_event_loop().create_task(self._run_agent(user_input))
 
-    # ── Agent worker (async streaming) ────────────────────────────────────
+    # ── Agent worker (async streaming via LangGraph) ─────────────────────
 
     async def _run_agent(self, user_input: str) -> None:
         """
-        Run the agent with streaming output.
-        Each StreamDelta updates the UI in real-time.
+        Run the agent via LangGraph dual-stream.
+
+        Two streams merged into one event handler:
+          - astream(stream_mode=values) → state snapshots → LLM tokens
+          - astream(stream_mode=custom) → custom events → tool calls, routing, usage
+
+        astream_events() is NOT used — it doesn't emit on_chain_stream
+        for custom LLM clients. State snapshots from 'values' mode
+        include the complete LLM response in messages.
         """
         self._streaming = True
         self._assistant_content = ""
@@ -272,77 +288,94 @@ class DeepXTUI(App):
         self._usage_output = 0
         self._usage_cache = 0
 
+        self._app_state["messages"].append({"role": "user", "content": user_input})
+        self._app_state["_mode"] = self._mode
+        config = {"configurable": {"thread_id": self.session_id}}
+
+        # Track seen message indices to detect new ones (for LLM response display)
+        seen_msg_count = len(self._app_state.get("messages", [])) - 1  # exclude user msg
+        # Also track LangChain messages (AIMessage, HumanMessage, ToolMessage)
+        seen_lc_count = 0
+
+        custom_queue: asyncio.Queue = asyncio.Queue()
+        pump_done = False
+
+        async def pump_custom():
+            """Drain astream(stream_mode=custom) → custom events."""
+            nonlocal pump_done
+            try:
+                async for chunk in self._workflow.astream(
+                    input=self._app_state,
+                    config=config,
+                    stream_mode="custom",
+                ):
+                    await custom_queue.put(chunk)
+            finally:
+                pump_done = True
+                await custom_queue.put(None)
+
         try:
-            async for delta in self.runner.call(user_input, mode=self._mode):
-                # Token chunks
-                if delta.content and not delta.tool_call and not delta.tool_call_done:
-                    if self._streaming_msg_id is None:
-                        self._streaming_msg_id = self.message_list.add_message_stream(
-                            "assistant", delta.content
-                        )
-                    else:
-                        self._assistant_content += delta.content
-                        self.message_list.update_stream(
-                            self._streaming_msg_id, self._assistant_content
-                        )
+            pump_task = asyncio.create_task(pump_custom())
 
-                # Reasoning content (shown separately if needed)
-                # For now, accumulated in content
+            # Primary: stream state snapshots (values) → LLM tokens
+            async for state_snapshot in self._workflow.astream(
+                input=self._app_state,
+                config=config,
+                stream_mode="values",
+            ):
+                messages = state_snapshot.get("messages", [])
 
-                # Tool call notification
-                if delta.tool_call and not delta.tool_call_done:
-                    args_preview = str(delta.tool_call.arguments)[:80]
-                    self._assistant_content += f"\n[Calling tool: {delta.tool_call.name}({args_preview})]\n"
-                    if self._streaming_msg_id:
-                        self.message_list.update_stream(
-                            self._streaming_msg_id, self._assistant_content
-                        )
-                    else:
-                        self._streaming_msg_id = self.message_list.add_message_stream(
-                            "assistant", self._assistant_content
-                        )
+                # Detect new messages by index; display only 'assistant' role
+                while seen_msg_count < len(messages):
+                    msg = messages[seen_msg_count]
+                    role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "type", "")
+                    # LangChain: "ai" → assistant, "human" → user
+                    if role == "ai":
+                        role = "assistant"
+                    elif role == "human":
+                        role = "user"
+                    content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
 
-                # Tool result
-                if delta.tool_call_done:
-                    self._assistant_content += delta.content
-                    if self._streaming_msg_id:
-                        self.message_list.update_stream(
-                            self._streaming_msg_id, self._assistant_content
-                        )
+                    # Display assistant responses (LLM tokens)
+                    if role == "assistant" and content:
+                        self._assistant_content += content
+                        self._emit_token(content)
 
-                # Stream done (final usage info)
-                if delta.done:
-                    self._usage_input = delta.input_tokens
-                    self._usage_output = delta.output_tokens
-                    self._usage_cache = delta.cache_hit_tokens
+                    seen_msg_count += 1
 
-                    if self._streaming_msg_id:
-                        self.message_list.update_stream(
-                            self._streaming_msg_id, self._assistant_content
-                        )
+                # Usage from state
+                input_t = state_snapshot.get("_total_input_tokens", 0)
+                if input_t and input_t != self._usage_input:
+                    self._usage_input = input_t
+                    self._usage_output = state_snapshot.get("_total_output_tokens", 0)
+                    self._usage_cache = state_snapshot.get("_total_cache_hits", 0)
+                    self._update_token_panel_async()
 
-                    # Update token panel
-                    model_name = self.settings.model_for("flash").model_id
-                    model_cfg = self.settings.model_for("flash")
-                    cache_pct = (
-                        self._usage_cache / self._usage_input * 100
-                        if self._usage_input
-                        else 0
-                    )
-                    cost = (
-                        self._usage_input * (model_cfg.input_price or 0) / 1_000_000
-                        + self._usage_output * (model_cfg.output_price or 0) / 1_000_000
-                    )
-                    self.call_after_refresh(
-                        lambda i=self._usage_input, o=self._usage_output,
-                               c=self._usage_cache, p=cache_pct, cost=cost:
-                            self._update_token_panel("flash", model_cfg.model_id,
-                                                      i, o, c, p, cost)
-                    )
+                # Drain custom events
+                while not custom_queue.empty() or not pump_done:
+                    if custom_queue.empty():
+                        try:
+                            await asyncio.wait_for(custom_queue.get(), timeout=0.001)
+                        except asyncio.TimeoutError:
+                            break
+                    ev = await custom_queue.get()
+                    if ev is None:
+                        break
+                    self._process_custom_event(ev)
 
-                # Error
-                if delta.error:
-                    self._append_to_stream(f"\n[Error: {delta.error}]\n")
+                # Check if done
+                next_node = state_snapshot.get("next_node")
+                if next_node == "end":
+                    # Update app_state with final snapshot
+                    self._app_state = state_snapshot
+                    # Drain remaining custom
+                    while not custom_queue.empty():
+                        ev = await custom_queue.get()
+                        if ev:
+                            self._process_custom_event(ev)
+                    self._streaming = False
+                    self._streaming_msg_id = None
+                    break
 
         except Exception as e:
             import traceback
@@ -352,10 +385,80 @@ class DeepXTUI(App):
             else:
                 self.message_list.add_message("assistant", error_msg)
             traceback.print_exc()
-
-        finally:
             self._streaming = False
             self._streaming_msg_id = None
+
+    def _emit_token(self, content: str) -> None:
+        """Append a token to the streaming message view."""
+        if not content:
+            return
+        if self._streaming_msg_id is None:
+            self._streaming_msg_id = self.message_list.add_message_stream(
+                "assistant", self._assistant_content
+            )
+        else:
+            self.message_list.update_stream(self._streaming_msg_id, self._assistant_content)
+
+    def _process_custom_event(self, event: dict) -> None:
+        """Process a custom event emitted via writer()."""
+        etype = event.get("type", "")
+        if etype != "custom":
+            return
+        data = event.get("data", {})
+        ct = data.get("type", "")
+
+        if ct == "tool_call":
+            fname = data.get("tool_name", "?")
+            args = str(data.get("tool_args", ""))[:80]
+            self._assistant_content += f"\n[Calling: {fname}({args})]\n"
+            self._append_to_stream(self._assistant_content)
+
+        elif ct == "tool_result":
+            fname = data.get("tool_name", "?")
+            result = data.get("result", "")
+            self._assistant_content += f"\n[Result: {fname}] {result[:200]}\n"
+            self._append_to_stream(self._assistant_content)
+
+        elif ct == "routing":
+            model = data.get("model", "?")
+            reason = data.get("reason", "")
+            self._assistant_content += f"\n[Model: {model} — {reason}]\n"
+            self._append_to_stream(self._assistant_content)
+
+        elif ct == "usage":
+            self._usage_input = data.get("input", 0)
+            self._usage_output = data.get("output", 0)
+            self._usage_cache = data.get("cache", 0)
+            self._update_token_panel_async()
+
+        elif ct == "error":
+            self._assistant_content += f"\n[Error: {data.get('message', '')}]\n"
+            self._append_to_stream(self._assistant_content)
+
+        elif ct == "state":
+            status = data.get("status", "")
+            self._assistant_content += f"\n[Status: {status}]\n"
+            self._append_to_stream(self._assistant_content)
+
+        elif ct == "compress":
+            self._assistant_content += "\n[Compressing context...]\n"
+            self._append_to_stream(self._assistant_content)
+
+    def _update_token_panel_async(self) -> None:
+        """Update token panel from the main thread."""
+        if not (self._usage_input or self._usage_output):
+            return
+        model_cfg = self.settings.model_for("flash")
+        cache_pct = self._usage_cache / self._usage_input * 100 if self._usage_input else 0
+        cost = (
+            self._usage_input * (model_cfg.input_price or 0) / 1_000_000
+            + self._usage_output * (model_cfg.output_price or 0) / 1_000_000
+        )
+        self.call_after_refresh(
+            lambda i=self._usage_input, o=self._usage_output,
+                   c=self._usage_cache, p=cache_pct, cost=cost:
+            self._update_token_panel("flash", model_cfg.model, i, o, c, p, cost)
+        )
 
     def _handle_token(self, content: str) -> None:
         """Handle a token from the LLM stream."""
