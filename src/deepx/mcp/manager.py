@@ -5,8 +5,11 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Any
 
+from deepx.logging_config import mcp_logger
 from deepx.mcp.client import Client, ServerStatus, ToolDef
 from deepx.mcp.config import ServerConfig, load_config
+
+logger = mcp_logger()
 
 
 # Restart cooldown matching Go version
@@ -49,16 +52,20 @@ class Manager:
 
     async def connect(self, config: ServerConfig) -> None:
         """Connect to a single server and immediately refresh tools."""
+        logger.info("connecting to MCP server: %s", config.name)
         async with self.lock:
             # Disconnect existing if any
             if config.name in self.clients:
+                logger.debug("disconnecting existing client for %s", config.name)
                 old = self.clients[config.name]
                 await old.close()
                 del self.clients[config.name]
 
             try:
                 client = await Client.connect(config)
+                logger.info("MCP server %s connected", config.name)
             except Exception as e:
+                logger.error("MCP server %s connection failed: %s", config.name, e)
                 self.status[config.name] = ServerStatus(
                     name=config.name,
                     connected=False,
@@ -70,7 +77,9 @@ class Manager:
 
             try:
                 tools = await client.list_tools()
+                logger.info("MCP %s: %d tools available", config.name, len(tools))
             except Exception as e:
+                logger.error("MCP %s tools/list failed: %s", config.name, e)
                 await client.close()
                 self.status[config.name] = ServerStatus(
                     name=config.name,

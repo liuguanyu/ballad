@@ -5,6 +5,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
+from deepx.logging_config import tools_logger
+
+logger = tools_logger()
+
 
 @dataclass
 class Tool(ABC):
@@ -62,7 +66,10 @@ class MCPTool(Tool):
         return str(result)
 
 
+# ---------------------------------------------------------------------------
 # Global tool registry
+# ---------------------------------------------------------------------------
+
 class ToolRegistry:
     """Singleton registry of all available tools."""
 
@@ -148,6 +155,7 @@ def register_tools() -> None:
         OCR(),
     ]:
         ToolRegistry.register(tool)
+        logger.debug("registered tool: %s", tool.name)
 
     # CodeGraph tools (all operations via one class)
     for name, description in [
@@ -167,6 +175,7 @@ def register_tools() -> None:
 
     # Skill tools — lazy import to avoid circular dependency
     _register_skill_tools()
+    logger.info("tools registered: %d total", len(ToolRegistry.all_tools()))
 
 
 def _register_skill_tools() -> None:

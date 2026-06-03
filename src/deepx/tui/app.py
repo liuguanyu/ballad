@@ -106,8 +106,10 @@ class DeepXTUI(App):
 
     def _start_background(self) -> None:
         """Register tools and connect MCP servers (non-blocking)."""
+        from deepx.logging_config import setup_logging
         from deepx.tools.base import register_tools
 
+        setup_logging()
         register_tools()
 
         async def init_mcp():

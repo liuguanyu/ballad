@@ -21,9 +21,10 @@ from deepx.agent.prefix_cache import PrefixCache
 from deepx.agent.router import route_model
 from deepx.config.settings import get_settings
 from deepx.llm.client import LLMClient, Message
+from deepx.logging_config import agent_logger
 from deepx.tools.base import ToolRegistry
 
-logger = logging.getLogger(__name__)
+logger = agent_logger()
 
 # Max rounds to prevent infinite loops
 MAX_ROUNDS = 100
@@ -89,6 +90,8 @@ class AgentRunner:
         self._output_tokens = 0
         self._cache_hits = 0
 
+        logger.debug("AgentRunner initialized, workspace=%s", self.workspace)
+
     # ── Public streaming interface ──────────────────────────────────────────
 
     async def call(self, user_input: str, mode: str = "review") -> AsyncIterator[StreamDelta]:
@@ -98,6 +101,7 @@ class AgentRunner:
         Yields StreamDelta chunks for real-time UI updates.
         Tool results are appended to self.messages for the next LLM call.
         """
+        logger.info("call start: mode=%s, input_len=%d", mode, len(user_input))
         # Append user message
         self.messages.append({"role": "user", "content": user_input})
 
@@ -113,10 +117,12 @@ class AgentRunner:
                 tail = str(last.get("content", ""))[:200]
                 suggested = route_model(tail)
                 if suggested == "pro":
+                    logger.info("routing: flash → pro (zero-token)")
                     model_name = "pro"
 
             # ── Context compression check ─────────────────────────────
             if self._compressor.should_compress(self.messages):
+                logger.info("context exceeded threshold, compressing (msgs=%d)", len(self.messages))
                 yield StreamDelta(content="\n[Compressing context...]\n")
                 compressed, _ = await self._compressor.compress(
                     self.messages,
@@ -125,6 +131,7 @@ class AgentRunner:
                     llm_client=self.llm,
                 )
                 self.messages = compressed
+                logger.info("compression done, reduced to %d msgs", len(self.messages))
                 yield StreamDelta(content="[Context compressed.]\n")
 
             # Build LLM messages
@@ -204,14 +211,22 @@ class AgentRunner:
                     for tc in tool_calls_accumulated
                 ]
             self.messages.append(assistant_msg)
+            logger.info(
+                "llm response: round=%d, model=%s, content_len=%d, tool_calls=%d",
+                round_num, model_name, len(full_content), len(tool_calls_accumulated),
+            )
             self._auto_save()
 
             # ── Execute tools if needed ────────────────────────────────
             if not tool_calls_accumulated:
                 # Done! No more tool calls.
+                logger.info("call done (no tool calls), total_tokens=%d/%d",
+                            self._input_tokens, self._output_tokens)
                 return
 
             for tc in tool_calls_accumulated:
+                logger.info("tool exec: round=%d, tool=%s, args=%s",
+                            round_num, tc.name, str(tc.arguments)[:100])
                 tool = ToolRegistry.get(tc.name)
                 if not tool:
                     result = f"Error: unknown tool '{tc.name}'. Available: {[t.name for t in ToolRegistry.all_tools()]}"
@@ -237,6 +252,7 @@ class AgentRunner:
             # Next round: re-call LLM with tool results
 
         # Max rounds reached
+        logger.warning("max rounds reached (%d), ending call", MAX_ROUNDS)
         yield StreamDelta(content="\n[Max rounds reached. Please start a new conversation.]", done=True)
 
     # ── Session management ──────────────────────────────────────────────────
