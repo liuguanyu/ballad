@@ -19,9 +19,12 @@ Event data types (emitted via writer):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
+
+from langgraph.types import StreamWriter
 
 from deepx.agent.router import route_model
 from deepx.config.settings import get_settings
@@ -29,15 +32,12 @@ from deepx.graph.state import DeepXState
 from deepx.llm.client import LLMClient, Message
 from deepx.tools.base import ToolRegistry
 
-if TYPE_CHECKING:
-    from langgraph.types import StreamWriter
-
 logger = logging.getLogger(__name__)
 
 MAX_ROUNDS = 100
 
 
-def _emit(writer: "StreamWriter | None", node: str, data: dict) -> None:
+def _emit(writer: StreamWriter | None, node: str, data: dict) -> None:
     """Emit a custom stream event via writer (non-blocking)."""
     if writer is None:
         return
@@ -82,7 +82,7 @@ def _build_messages_for_llm(messages: list) -> list[Message]:
 
 async def agent_node(
     state: DeepXState,
-    writer: "StreamWriter | None" = None,
+    writer: StreamWriter = None,
 ) -> dict[str, Any]:
     """
     Main Agent node — calls LLM with current history, emits stream events.
@@ -108,7 +108,10 @@ async def agent_node(
     # Zero-token routing
     if model_name == "flash" and len(messages) >= 2:
         last = messages[-1] if messages else {}
-        tail = str(last.get("content", ""))[:200]
+        if hasattr(last, "content"):
+            tail = str(last.content)[:200]
+        else:
+            tail = str(last.get("content", ""))[:200]
         suggested = route_model(tail)
         if suggested == "pro":
             model_name = "pro"
@@ -236,7 +239,7 @@ async def agent_node(
 
 async def tools_node(
     state: DeepXState,
-    writer: "StreamWriter | None" = None,
+    writer: StreamWriter = None,
 ) -> dict[str, Any]:
     """Execute pending tool_calls and emit results."""
     tool_calls: list[dict] = state.get("tool_calls") or []
@@ -296,17 +299,137 @@ async def tools_node(
 
 async def plan_node(
     state: DeepXState,
-    writer: "StreamWriter | None" = None,
+    writer: StreamWriter = None,
 ) -> dict[str, Any]:
     """
     Analyze the user task and decompose it into parallel sub-tasks.
 
-    The subtasks are returned as a list, which the workflow routes to
-    subagents_node for parallel execution via LangGraph Send().
+    Uses the last user message + context to create independent subtasks.
+    Each subtask has: id, description, target_files, priority.
+    
+    The subtasks are returned as a list, which routes to subagents_node
+    for parallel execution via LangGraph Send().
     """
     _emit(writer, "plan", {"type": "state", "status": "planning"})
-    # TODO: LLM-based task decomposition
-    return {"subtasks": [], "next_node": "subagents"}
+    messages: list[dict] = state.get("messages", [])
+    
+    # Get the user's current task
+    user_msgs = [m for m in messages if _get_role(m) == "user"]
+    last_task = user_msgs[-1].get("content", "") if user_msgs else ""
+    
+    # Also include recent file context (from tool results or explicit context)
+    context_snippets = []
+    for m in messages[-6:]:
+        role = _get_role(m)
+        content = m.get("content", "") if isinstance(m, dict) else ""
+        if role == "system" and "files:" in content:
+            context_snippets.append(content)
+    
+    task_description = last_task or state.get("task", "")
+    
+    if not task_description:
+        _emit(writer, "plan", {"type": "tool_result", "tool_name": "plan", "result": "No task to plan"})
+        return {"subtasks": [], "next_node": None}
+    
+    _emit(writer, "plan", {"type": "tool_result", "tool_name": "plan", "result": f"Analyzing: {task_description[:60]}..."})
+    
+    # Call LLM to decompose the task
+    subtasks = await _decompose_task(task_description, context_snippets, writer)
+    
+    _emit(writer, "plan", {
+        "type": "tool_result",
+        "tool_name": "plan",
+        "result": f"Created {len(subtasks)} sub-tasks" + (
+            "".join(f"\n  {i+1}. {s.get('description', '')[:60]}" for i, s in enumerate(subtasks))
+            if subtasks else ""
+        ),
+    })
+    
+    return {"subtasks": subtasks, "next_node": "subagents"}
+
+
+async def _decompose_task(
+    task: str,
+    context: list[str],
+    writer: StreamWriter = None,
+) -> list[dict]:
+    """
+    Use LLM to decompose a complex task into independent sub-tasks.
+
+    Returns a list of subtask dicts:
+      {id, description, target_files, priority, agent_type}
+    """
+    from deepx.config.settings import get_settings
+    from deepx.llm.client import LLMClient, Message
+
+    settings = get_settings()
+    model_cfg = settings.flash_model()
+    llm = LLMClient(api_key=model_cfg.api_key, base_url=model_cfg.base_url)
+
+    context_text = "\n".join(context[:3]) if context else ""
+    
+    context_hint = f"Context:\n{context_text}" if context_text else ""
+
+    prompt = f"""\
+You are a task planning assistant. Decompose the following task into 2-5 independent sub-tasks that can be executed in parallel.
+
+Requirements:
+- Each subtask should be self-contained (no dependencies between subtasks)
+- Each subtask should focus on a specific file or set of files
+- Be specific about what to do and what files to modify
+
+Return ONLY a JSON array (no markdown, no explanation):
+[
+  {{"id": "task-1", "description": "what to do", "target_files": ["path/to/file"], "priority": "high|medium|low"}},
+  ...
+]
+
+Task: {task}
+{context_hint}
+"""
+    
+    try:
+        content_parts = []
+        async for chunk in llm.chat(
+            messages=[
+                Message(role="system", content="You are a JSON-only assistant. Output ONLY valid JSON array."),
+                Message(role="user", content=prompt),
+            ],
+            model=model_cfg,
+            tools=None,
+            stream=True,
+        ):
+            if chunk.error:
+                _emit(writer, "plan", {"type": "error", "message": f"Planning failed: {chunk.error}"})
+                break
+            if chunk.content:
+                content_parts.append(chunk.content)
+        
+        raw = "".join(content_parts).strip()
+        # Extract JSON from response
+        json_start = raw.find("[")
+        json_end = raw.rfind("]") + 1
+        if json_start >= 0 and json_end > json_start:
+            import json as _json
+            tasks = _json.loads(raw[json_start:json_end])
+            if isinstance(tasks, list) and tasks:
+                return tasks
+    except Exception as e:
+        _emit(writer, "plan", {"type": "error", "message": f"Planning LLM error: {e}"})
+    
+    # Fallback: single task wrapping the original
+    return [{
+        "id": "task-1",
+        "description": task[:200],
+        "target_files": [],
+        "priority": "medium",
+    }]
+
+
+def _get_role(msg) -> str:
+    if isinstance(msg, dict):
+        return msg.get("role", "")
+    return getattr(msg, "type", "")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -315,41 +438,304 @@ async def plan_node(
 
 async def subagents_node(
     state: DeepXState,
-    writer: "StreamWriter | None" = None,
+    writer: StreamWriter = None,
 ) -> dict[str, Any]:
     """
-    Execute independent sub-tasks in parallel using LangGraph Send().
+    Execute sub-tasks in parallel using asyncio.gather.
 
-    Each Send() spawns a concurrent agent invocation.
-    Results are collected and the TUI shows parallel progress.
+    Each sub-task runs a standalone ReAct loop (agent logic) concurrently.
+    Results are collected and surfaced in the parent state as subtask_results[].
+    
+    For the TUI, emits parallel_start + per-subtask tool_result events.
     """
     subtasks: list[dict] = state.get("subtasks") or []
+    mode = state.get("_mode", "auto")
+
     if not subtasks:
         return {
             "messages": [{"role": "assistant", "content": "[No sub-tasks to execute.]"}],
+            "subtask_results": [],
             "next_node": None,
         }
 
-    _emit(writer, "subagents", {"type": "state", "status": "parallel_start", "task_count": len(subtasks)})
+    _emit(writer, "subagents", {
+        "type": "state",
+        "status": "parallel_start",
+        "task_count": len(subtasks),
+        "tasks": [{"id": t.get("id", f"task-{i}"), "desc": t.get("description", "")[:80]}
+                  for i, t in enumerate(subtasks)],
+    })
 
-    # TODO: implement Send()-based parallel execution
-    # For now: sequential stub
-    results = []
-    for task in subtasks:
-        task_id = task.get("id", "?")
-        _emit(writer, "subagents", {
-            "type": "tool_result",
-            "tool_name": "subagent",
-            "result": f"[Running task {task_id}...]",
-            "tool_id": task_id,
-        })
-        results.append({"task_id": task_id, "result": "[stub]"})
+    # Build isolated state for each sub-agent
+    sub_states = [
+        _build_subagent_state(state, i, subtask)
+        for i, subtask in enumerate(subtasks)
+    ]
+
+    # Run all sub-agents concurrently
+    results = await asyncio.gather(
+        *[_run_subagent(sub, mode, writer, task_idx=i) for i, sub in enumerate(sub_states)],
+        return_exceptions=True,
+    )
+
+    # Collect results
+    subtask_results = []
+    for i, result in enumerate(results):
+        task_id = subtasks[i].get("id", f"task-{i}")
+        if isinstance(result, Exception):
+            subtask_results.append({
+                "task_id": task_id,
+                "status": "error",
+                "result": f"Error: {result}",
+                "output_tokens": 0,
+            })
+            _emit(writer, "subagents", {
+                "type": "tool_result",
+                "tool_name": "subagent",
+                "result": f"[Error] {result}",
+                "tool_id": task_id,
+            })
+        else:
+            subtask_results.append({
+                "task_id": task_id,
+                "status": "done",
+                "result": str(result)[:500],
+                "output_tokens": sub_states[i].get("total_output_tokens", 0),
+            })
+            _emit(writer, "subagents", {
+                "type": "tool_result",
+                "tool_name": "subagent",
+                "result": f"[Done] {str(result)[:100]}",
+                "tool_id": task_id,
+            })
+
+    # Summary message in parent conversation
+    done = [r for r in subtask_results if r["status"] == "done"]
+    errors = [r for r in subtask_results if r["status"] == "error"]
+    summary_parts = []
+    if done:
+        summary_parts.append(f"{len(done)} tasks completed")
+    if errors:
+        summary_parts.append(f"{len(errors)} failed")
+    summary = ", ".join(summary_parts) or "No tasks"
 
     return {
-        "subtask_results": results,
-        "messages": [{"role": "assistant", "content": f"[Parallel execution completed {len(subtasks)} tasks]"}],
+        "subtask_results": subtask_results,
+        "messages": [{
+            "role": "assistant",
+            "content": f"[Parallel execution: {summary}]\n" +
+                       "\n".join(
+                           f"- [{r['task_id']}] {r['status']}: {r['result'][:80]}"
+                           for r in subtask_results
+                       ),
+        }],
         "next_node": None,
     }
+
+
+def _build_subagent_state(
+    parent: DeepXState,
+    idx: int,
+    subtask: dict[str, Any],
+) -> dict[str, Any]:
+    """Build isolated state for one sub-agent invocation."""
+    task_desc = subtask.get("description", "")
+    target_files = subtask.get("target_files", [])
+    files_hint = "\n".join(f"  - {f}" for f in target_files) if target_files else ""
+    mode = parent.get("_mode", "auto")
+
+    system_prompt = f"""\
+You are a specialized sub-agent completing a single task.
+
+**Your Task**: {task_desc}
+{files_hint}
+
+**Mode: {mode.upper()}**
+- auto: execute automatically
+- review: confirm destructive actions  
+- plan: analyze only, no writes
+
+Focus ONLY on your task. Be concise and precise.
+Report results clearly at the end."""
+
+    return {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Complete this task:\n{task_desc}"},
+        ],
+        "task": task_desc,
+        "subtask_id": subtask.get("id", f"task-{idx}"),
+        "subtask_idx": idx,
+        "model": parent.get("model", "flash"),
+        "next_node": None,
+        "round": 0,
+        "tool_calls": None,
+        "tool_results": None,
+        "context_budget": parent.get("context_budget", 200_000),
+        "compress_triggered": False,
+        "compressed_history": None,
+        "session_id": f"sub-{parent.get('session_id', '')}-{idx}",
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cache_hits": 0,
+        "_mode": mode,
+        "_total_input_tokens": 0,
+        "_total_output_tokens": 0,
+        "_total_cache_hits": 0,
+    }
+
+
+async def _run_subagent(
+    sub_state: dict,
+    parent_mode: str,
+    writer: StreamWriter = None,
+    task_idx: int = 0,
+) -> str:
+    """
+    Run a single sub-agent's ReAct loop until completion (no tool calls or tools done).
+
+    This is a standalone async function that can run concurrently via asyncio.gather.
+    Each sub-agent gets its own LLM client and isolated state.
+    """
+    task_id = sub_state.get("subtask_id", f"task-{task_idx}")
+    MAX_SUB_ROUNDS = 20
+    sub_round = 0
+    sub_messages: list[dict] = sub_state.get("messages", [])
+    sub_model = sub_state.get("model", "flash")
+
+    settings = get_settings()
+    model_cfg = settings.model_for(sub_model)
+
+    while sub_round < MAX_SUB_ROUNDS:
+        sub_round += 1
+
+        # Call LLM
+        system_prompt = next(
+            (m["content"] for m in sub_messages if m.get("role") == "system"),
+            "",
+        )
+        llm_messages = [Message(role="system", content=system_prompt)]
+        for m in sub_messages:
+            if m.get("role") != "system":
+                llm_messages.append(Message(**m))
+
+        tool_specs = ToolRegistry.specs()
+        llm = LLMClient(api_key=model_cfg.api_key, base_url=model_cfg.base_url)
+
+        content_parts = []
+        tool_calls = []
+        input_t = 0
+        output_t = 0
+        cache_t = 0
+
+        try:
+            async for chunk in llm.chat(
+                messages=llm_messages,
+                model=model_cfg,
+                tools=tool_specs or None,
+                reasoning_effort=model_cfg.reasoning_effort,
+                stream=True,
+            ):
+                if chunk.error:
+                    _emit(writer, "subagents", {
+                        "type": "error",
+                        "message": f"Sub-agent {task_id} error: {chunk.error}",
+                    })
+                    return f"Error: {chunk.error}"
+
+                if chunk.content:
+                    content_parts.append(chunk.content)
+                if chunk.reasoning:
+                    content_parts.append(f"[Think: {chunk.reasoning[:100]}]")
+
+                if chunk.tool_call and chunk.tool_call.name:
+                    args_raw = chunk.tool_call.arguments
+                    if isinstance(args_raw, str):
+                        try:
+                            args_raw = json.loads(args_raw) if args_raw else {}
+                        except json.JSONDecodeError:
+                            args_raw = {"_raw": args_raw}
+                    elif not isinstance(args_raw, dict):
+                        args_raw = {"_raw": str(args_raw)}
+
+                    existing = next(
+                        (tc for tc in tool_calls if tc.get("id") == chunk.tool_call.id),
+                        None,
+                    )
+                    if existing is None:
+                        tool_calls.append({
+                            "id": chunk.tool_call.id,
+                            "type": "function",
+                            "function": {"name": chunk.tool_call.name, "arguments": args_raw},
+                        })
+
+                if chunk.done and chunk.usage:
+                    input_t = chunk.usage.prompt_tokens
+                    output_t = chunk.usage.completion_tokens
+                    cache_t = chunk.usage.prompt_cache_hit_tokens
+
+        finally:
+            await llm.close()
+
+        full_content = "".join(content_parts)
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+
+        sub_messages.append(assistant_msg)
+
+        # Execute tools if any
+        if not tool_calls:
+            # Sub-agent done
+            sub_state["total_output_tokens"] += output_t
+            return full_content or "[Done]"
+
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            raw_args = func.get("arguments", "{}")
+
+            if isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    args = {}
+            elif isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                args = {}
+
+            _emit(writer, "subagents", {
+                "type": "tool_call",
+                "tool_id": task_id,
+                "tool_name": name,
+                "tool_args": {k: str(v)[:50] for k, v in args.items()},
+            })
+
+            tool = ToolRegistry.get(name)
+            if not tool:
+                result = f"Unknown tool: {name}"
+            else:
+                try:
+                    result = await tool.execute(**args)
+                except Exception as e:
+                    result = f"Error: {e}"
+
+            _emit(writer, "subagents", {
+                "type": "tool_result",
+                "tool_name": name,
+                "result": str(result)[:150],
+                "tool_id": task_id,
+            })
+
+            sub_messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id", ""),
+                "name": name,
+                "content": str(result)[:3000],
+            })
+
+    return f"[Max rounds ({MAX_SUB_ROUNDS}) reached for {task_id}]"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -358,7 +744,7 @@ async def subagents_node(
 
 async def compress_node(
     state: DeepXState,
-    writer: "StreamWriter | None" = None,
+    writer: StreamWriter = None,
 ) -> dict[str, Any]:
     """Compress history when context exceeds threshold."""
     messages = state.get("messages", [])
@@ -379,7 +765,7 @@ async def compress_node(
 
 async def model_switch_node(
     state: DeepXState,
-    writer: "StreamWriter | None" = None,
+    writer: StreamWriter = None,
 ) -> dict[str, Any]:
     _emit(writer, "model_switch", {"type": "routing", "model": "pro", "reason": "model_switch triggered"})
     return {"model": "pro", "next_node": "agent"}

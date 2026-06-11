@@ -16,7 +16,7 @@ from deepx.llm.usage import UsageInfo
 class ToolCall(BaseModel):
     id: str
     name: str
-    arguments: dict[str, Any]
+    arguments: Any = {}
 
 
 class ToolCallBlock(BaseModel):
@@ -151,10 +151,21 @@ class LLMClient:
                 chunk = StreamChunk(content=msg.get("content", ""), done=True)
                 if tc_data:
                     tc = tc_data[0]
+                    args_raw = tc.get("function", {}).get("arguments", "{}")
+                    if isinstance(args_raw, str):
+                        try:
+                            parsed = json.loads(args_raw) if args_raw else {}
+                            args_value = parsed if isinstance(parsed, dict) else {"_raw": args_raw}
+                        except json.JSONDecodeError:
+                            args_value = {"_raw": args_raw}
+                    elif isinstance(args_raw, dict):
+                        args_value = args_raw
+                    else:
+                        args_value = {"_raw": str(args_raw)}
                     chunk.tool_call = ToolCall(
                         id=tc.get("id", ""),
                         name=tc.get("function", {}).get("name", ""),
-                        arguments=json.loads(tc.get("function", {}).get("arguments", "{}")),
+                        arguments=args_value,
                     )
                 if u := data.get("usage"):
                     chunk.usage = UsageInfo(
@@ -189,10 +200,23 @@ class LLMClient:
                 chunk.reasoning = delta["reasoning_content"]
             if delta.get("tool_calls"):
                 tc = delta["tool_calls"][0]
+                function = tc.get("function", {})
+                args_raw = function.get("arguments", "")
+                args_dict: dict[str, Any] = {}
+                if isinstance(args_raw, dict):
+                    args_dict = args_raw
+                elif isinstance(args_raw, str) and args_raw:
+                    try:
+                        parsed = json.loads(args_raw)
+                        args_dict = parsed if isinstance(parsed, dict) else {"_raw": args_raw}
+                    except json.JSONDecodeError:
+                        args_dict = {"_raw": args_raw}
+                elif args_raw not in (None, ""):
+                    args_dict = {"_raw": str(args_raw)}
                 chunk.tool_call = ToolCall(
                     id=tc.get("id", ""),
-                    name=tc.get("function", {}).get("name", ""),
-                    arguments=json.loads(tc.get("function", {}).get("arguments", "{}")),
+                    name=function.get("name", ""),
+                    arguments=args_dict,
                 )
             if finish:
                 chunk.done = True

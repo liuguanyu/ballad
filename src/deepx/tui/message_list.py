@@ -6,42 +6,33 @@ from textual.widgets import Static
 
 
 class MessageView(Static):
-    """A single message bubble in the chat."""
-
-    CSS = """
-    MessageView {
-        width: 100%;
-        margin: 0 0 1 0;
-        padding: 1 2;
-        border: none;
-    }
-    MessageView.user {
-        color: $text;
-    }
-    MessageView.assistant {
-        color: $text;
-    }
-    MessageView.tool {
-        color: $text-muted;
-        border-left: solid $primary;
-    }
-    MessageView.thinking {
-        color: $text-muted;
-        text-style: italic;
-    }
-    """
+    """A single message row in the chat."""
 
     def __init__(self, role: str, content: str, msg_id: str | None = None):
-        super().__init__(content, id=msg_id)
+        prefix = self._prefix_for_role(role)
+        super().__init__(f"{prefix}{content}", id=msg_id, markup=False)
         self.role = role
         self.add_class("message-view")
         self.add_class(role)
         self._content = content
 
+    @staticmethod
+    def _prefix_for_role(role: str) -> str:
+        if role == "assistant":
+            return "  "
+        if role == "user":
+            return "You: "
+        if role == "tool":
+            return "Tool: "
+        if role == "thinking":
+            return "Thinking: "
+        return ""
+
     def set_content(self, content: str) -> None:
         """Set the message content."""
         self._content = content
-        self.update(content)
+        prefix = self._prefix_for_role(self.role)
+        Static.update(self, f"{prefix}{content}")
 
 
 class MessageList(ScrollableContainer):
@@ -56,7 +47,11 @@ class MessageList(ScrollableContainer):
     MessageList {
         width: 100%;
         height: 1fr;
+        border: none;
         scrollbar-gutter: stable;
+        background: #010409;
+    }
+    MessageList:focus {
         border: none;
     }
     """
@@ -69,7 +64,7 @@ class MessageList(ScrollableContainer):
 
     def _scroll(self) -> None:
         """Scroll to the bottom."""
-        self.call_after_refresh(self.scroll_to_end)
+        self.call_after_refresh(self.scroll_end)
 
     # ── Add message ──────────────────────────────────────────────────────────
 

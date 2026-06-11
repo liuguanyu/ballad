@@ -57,6 +57,8 @@ dependencies = [
     "rapidocr>=3.8.1",
     "duckduckgo-search>=8.1.1",
     "ddgs>=9.14.4",
+    "ptyprocess>=0.7.0",
+    "pyte>=0.8.2",
 ]
 
 [project.optional-dependencies]

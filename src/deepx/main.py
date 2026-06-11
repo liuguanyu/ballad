@@ -11,15 +11,51 @@ _mcp_manager = None
 
 def run():
     """Run DeepX: CLI or TUI based on arguments."""
+    # Disable Textual's Kitty keyboard protocol before textual is imported.
+    # Kitty mode is incompatible with iTerm2's IME: CJK commit sequences get
+    # misparsed as control keys (left_control/backspace) and Chinese input is
+    # silently dropped. constants.DISABLE_KITTY_KEY is read once at import time,
+    # so this must run before any textual import.
+    os.environ.setdefault("TEXTUAL_DISABLE_KITTY_KEY", "1")
+
     argv = sys.argv[1:]
 
     # If no args or shell/tui, launch full TUI
     if not argv or argv[0] in ("shell", "tui", "web"):
         _run_tui()
+    elif argv[0] == "repl":
+        _run_repl()
     else:
         # CLI mode
         from deepx.cli import app
         app()
+
+def _run_repl():
+    """Launch the prompt_toolkit REPL."""
+    from deepx.tools.base import register_tools
+    from deepx.skill.builtin import extract_builtins
+    from deepx.skill.tool_registry import set_skill_loader
+    from deepx.skill.loader import Loader
+    from deepx.repl import run_repl
+
+    register_tools()
+
+    home = str(Path.home())
+    extract_builtins(home)
+
+    cwd = str(Path.cwd())
+    workspace_skills = os.path.join(cwd, ".deepx", "skills")
+    loader = Loader(
+        workspace_dirs=[workspace_skills],
+        global_dirs=[
+            os.path.join(home, ".agents", "skills"),
+            os.path.join(home, ".claude", "skills"),
+            os.path.join(home, ".deepx", "skills"),
+        ],
+    )
+    set_skill_loader(loader)
+
+    asyncio.run(run_repl())
 
 
 def _run_tui():

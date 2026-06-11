@@ -1,21 +1,23 @@
 """
 Conditional edges for the DeepX LangGraph.
 
-Routing logic (deterministic, no infinite loop):
+Routing logic:
 
-  - next_node = "tools"  → tools_node (explicit)
-  - next_node = "end"   → END (explicit)
-  - next_node = anything else (or None) → check last assistant message
+  Explicit next_node from node return values:
+    "tools"       → tools_node (execute pending tool calls)
+    "plan"        → plan_node (decompose into parallel sub-tasks)
+    "compress"    → compress_node (context exceeded threshold)
+    "model_switch" → model_switch_node (flash → pro upgrade)
+    "end"         → END (conversation complete)
 
-  Last assistant message check:
-    - has tool_calls → "tools"  (execute tools, then loop)
-    - otherwise     → "end"    (conversation complete)
+  Fallback when next_node is None or "agent":
+    - Check last user message for planning keywords → "plan"
+    - Check last assistant message for tool_calls → "tools"
+    - Otherwise → "end"
 
-This ensures:
-  - tools_node returns next_node="agent" (→ merged into state)
-  - BUT decide_next ignores "agent" (only handles "tools"/"end" explicitly)
-  - Next call: next_node=None → check messages → no tool_calls → "end"
-  → No infinite loop ✓
+This ensures no infinite loops:
+  - tools_node returns next_node=None → next decide_next → checks messages
+  - subagents_node returns next_node=None → back to agent
 """
 from __future__ import annotations
 
@@ -26,29 +28,67 @@ from deepx.graph.state import DeepXState
 
 def decide_next(state: DeepXState) -> Literal["tools", "agent", "plan", "compress", "model_switch", "end"]:
     """
-    Decide the next node.
+    Decide the next node from current state.
 
-    Only respects next_node when explicitly "tools" or "end".
-    Otherwise, always checks the actual last assistant message content.
-    This prevents infinite loops from nodes that set next_node="agent".
+    Priority:
+      1. Explicit next_node from node return value (highest)
+      2. Last user message contains planning keywords → "plan"
+      3. Last assistant message has tool_calls → "tools"
+      4. Otherwise → "end"
     """
     explicit = state.get("next_node")
 
-    # Only respect explicit routing for explicit targets
-    if explicit in ("tools", "end"):
-        return explicit
+    # Explicit routing (set by node return values)
+    if explicit in ("tools", "end", "plan", "compress", "model_switch", "agent"):
+        if explicit == "agent":
+            explicit = None  # fall through to message-based check
+        else:
+            return explicit
 
-    # For all other values (including "agent", "plan", None, etc.)
-    # → check the actual last assistant message
     messages: list[dict] = state.get("messages", [])
-    if messages:
-        last = messages[-1]
-        if last.get("role") == "assistant":
-            # Check for tool calls in the message
-            if last.get("tool_calls"):
+
+    # Check last user message for planning keywords
+    for m in reversed(messages):
+        role = _get_role(m)
+        content = _get_content(m)
+        if role == "user" and content:
+            lower = content.lower()
+            plan_keywords = [
+                "plan", "replan", "refactor", "re-factor", "re factor",
+                "重构", "implement", "实现", "build", "建设",
+                "migrate", "迁移", "upgrade", "升级",
+                "parallel", "parallelize", "并行", "同时",
+                "multi-step", "多步", "split", "分解", "decompose",
+                "do these in parallel", "run these in parallel",
+            ]
+            if any(kw in lower for kw in plan_keywords):
+                return "plan"
+            break  # found last user message, stop checking
+
+    # Check last assistant message for tool calls
+    for m in reversed(messages):
+        role = _get_role(m)
+        if role == "assistant":
+            if _has_tool_calls(m):
                 return "tools"
-            # No tool calls → conversation is complete
             return "end"
 
-    # No messages yet
     return "end"
+
+
+def _get_role(msg) -> str:
+    if isinstance(msg, dict):
+        return msg.get("role", "")
+    return getattr(msg, "type", "")
+
+
+def _get_content(msg) -> str:
+    if isinstance(msg, dict):
+        return msg.get("content", "")
+    return getattr(msg, "content", "")
+
+
+def _has_tool_calls(msg) -> bool:
+    if isinstance(msg, dict):
+        return bool(msg.get("tool_calls"))
+    return bool(getattr(msg, "tool_calls", None))

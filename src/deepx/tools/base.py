@@ -10,7 +10,6 @@ from deepx.logging_config import tools_logger
 logger = tools_logger()
 
 
-@dataclass
 class Tool(ABC):
     """Base class for all DeepX tools.
 
@@ -22,7 +21,15 @@ class Tool(ABC):
 
     name: str = ""
     description: str = ""
-    parameters: dict[str, Any] = field(default_factory=dict)
+    parameters: dict[str, Any] = {}
+
+    def __init__(self, name: str = "", description: str = "", parameters: dict[str, Any] | None = None):
+        if name:
+            self.name = name
+        if description:
+            self.description = description
+        if parameters is not None:
+            self.parameters = parameters
 
     def to_spec(self) -> dict[str, Any]:
         """Export as OpenAI function-calling format."""
@@ -80,6 +87,9 @@ class ToolRegistry:
 
     @classmethod
     def register(cls, tool: Tool) -> None:
+        if not tool.name:
+            logger.warning("skipping tool registration with empty name: %s", tool)
+            return
         if tool.name in cls._by_name:
             return  # already registered, skip
         cls._tools.append(tool)
@@ -97,8 +107,8 @@ class ToolRegistry:
 
     @classmethod
     def specs(cls) -> list[dict]:
-        """Export all tools as OpenAI function specs."""
-        return [t.to_spec() for t in cls._tools + cls._mcp_tools]
+        """Export all tools as OpenAI function specs (skips tools with empty name)."""
+        return [t.to_spec() for t in cls._tools + cls._mcp_tools if t.name]
 
     @classmethod
     def set_mcp_tools(cls, tool_dicts: list[dict]) -> None:
@@ -109,8 +119,12 @@ class ToolRegistry:
             executor = td.get("_executor")
             if not callable(executor):
                 continue
+            name = td.get("name", "")
+            if not name:
+                logger.warning("skipping MCP tool with empty name: %s", td)
+                continue
             t = MCPTool(
-                name=td.get("name", ""),
+                name=name,
                 description=td.get("description", ""),
                 parameters=td.get("parameters", {}),
                 executor=executor,

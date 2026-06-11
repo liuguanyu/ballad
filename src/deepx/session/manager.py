@@ -22,11 +22,13 @@ class SessionManager:
 
     def __init__(self, workspace: Path | str):
         self.store = SessionStore(workspace)
-        self.current_conv_id: str | None = None
+        self.current_conv_id: str | None = self.store._read_current_conversation_id()
         # In-memory state (loaded lazily)
         self._history: list[dict] | None = None
         self._total_usage = UsageInfo()
         self._mode = "review"
+        self._input_history: list[str] = []
+        self._input_history_index: int | None = None
 
     # ── History ─────────────────────────────────────────────────────────────
 
@@ -48,6 +50,48 @@ class SessionManager:
             self.current_conv_id,
         )
 
+    def add_input_history(self, text: str) -> None:
+        """Add a user prompt to input history for textarea navigation."""
+        value = text.strip()
+        if not value:
+            return
+        if value in self._input_history:
+            self._input_history.remove(value)
+        self._input_history.append(value)
+        self._input_history_index = None
+
+    def get_previous_input(self) -> str | None:
+        """Return previous prompt for textarea history navigation."""
+        if not self._input_history:
+            return None
+        if self._input_history_index is None:
+            self._input_history_index = len(self._input_history) - 1
+        elif self._input_history_index > 0:
+            self._input_history_index -= 1
+        return self._input_history[self._input_history_index]
+
+    def get_next_input(self) -> str:
+        """Return next prompt for textarea history navigation."""
+        if not self._input_history:
+            return ""
+        if self._input_history_index is None:
+            return self._input_history[-1]
+        if self._input_history_index < len(self._input_history) - 1:
+            self._input_history_index += 1
+            return self._input_history[self._input_history_index]
+        self._input_history_index = None
+        return ""
+
+    def input_history_count(self) -> int:
+        """Return count of saved input prompts."""
+        return len(self._input_history)
+
+    def input_history_position(self) -> int | None:
+        """Return 1-based current position in input history."""
+        if self._input_history_index is None:
+            return None
+        return self._input_history_index + 1
+
     def load_recent_turns(self, n: int = 10) -> list[dict]:
         """Load the most recent n user turns (reverse date order, lazy)."""
         history = self.history
@@ -63,6 +107,7 @@ class SessionManager:
     def clear(self) -> None:
         """Clear in-memory history (doesn't delete files)."""
         self._history = []
+        self._input_history_index = None
 
     # ── Usage tracking ───────────────────────────────────────────────────────
 
@@ -109,12 +154,14 @@ class SessionManager:
         """Start a new conversation and return its id."""
         self.current_conv_id = self.store.create_conversation()
         self._history = []
+        self._input_history_index = None
         return self.current_conv_id
 
     def switch_conversation(self, cid: str) -> None:
         """Switch to a different conversation."""
         self.current_conv_id = cid
         self._history = None  # Reload lazily
+        self._input_history_index = None
 
     # ── Mode ───────────────────────────────────────────────────────────────
 

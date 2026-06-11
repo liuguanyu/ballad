@@ -1,66 +1,49 @@
-"""Token panel widget — right-side status display."""
+"""
+TokenPanel — right-side status panel with expand/collapse.
+
+Toggle modes:
+  Ctrl+T → show/hide panel (always collapsed width)
+  Ctrl+O → expand/collapse detail view within panel
+
+Compact view (collapsed): model + token summary
+Expanded view (Ctrl+O): full status including model, mode, round,
+  message count, context usage, parallel tasks, cache, cost
+"""
 from __future__ import annotations
 
+from typing import Any
+
+from textual.message import Message
 from textual.widgets import Static
+
+
+class PanelExpandRequest(Message):
+    """Request to expand the token panel."""
 
 
 class TokenPanel(Static):
     """
-    Right-side status panel showing endpoint, tokens, cache rate, and cost.
+    Right-side status panel. Toggle with Ctrl+T, expand with Ctrl+O.
 
-    Toggle with Ctrl+T. Displays real-time API usage information.
-
-    DeepX original feature.
+    Two views:
+      compact: model + token summary (default)
+      expanded: full status with parallel tasks
     """
 
     CSS = """
     TokenPanel {
-        width: 0;        /* starts hidden, expands when .panel-open */
         dock: right;
-        background: $surface;
-        border-left: solid $primary;
+        width: 0;
+        display: none;
+        background: #0d1117;
+        border-left: solid #58a6ff;
         padding: 1 2;
-        transition: width 200ms;
+        overflow: hidden;
     }
 
-    .panel-open {
-        width: 220;
-    }
-
-    .panel-title {
-        text-style: bold;
-        color: $accent;
-        margin-bottom: 1;
-    }
-
-    .panel-section {
-        margin-bottom: 1;
-    }
-
-    .panel-label {
-        color: $text-muted;
-        width: 70;
-    }
-
-    .panel-value {
-        color: $text;
-    }
-
-    .panel-good {
-        color: #3fb950;
-    }
-
-    .panel-warn {
-        color: #d29922;
-    }
-
-    .panel-bad {
-        color: #f85149;
-    }
-
-    .panel-divider {
-        color: $primary;
-        opacity: 0.5;
+    TokenPanel.panel-open {
+        display: block;
+        width: 32;
     }
     """
 
@@ -68,24 +51,42 @@ class TokenPanel(Static):
         super().__init__(id="token-panel")
         self._reset()
 
-    def _reset(self):
-        self.stats = {
+    def _reset(self) -> None:
+        self._expanded = False
+        self.stats: dict[str, Any] = {
             "endpoint": "flash",
-            "model": "DeepSeek-v3",
+            "model": "—",
+            "mode": "review",
             "input_tokens": 0,
             "output_tokens": 0,
             "cache_hit": 0,
             "cache_pct": 0.0,
             "total_cost": 0.0,
             "round": 0,
+            "msg_count": 0,
             "context_used": 0,
-            "context_limit": 1_000_000,
+            "context_limit": 200_000,
+            # Parallel tasks
+            "parallel_active": False,
+            "parallel_tasks": [],      # [{id, desc, status, tool}]
+            "parallel_done": 0,
+            "parallel_errors": 0,
         }
 
     def reset(self) -> None:
-        """Reset all stats."""
         self._reset()
-        self.update_content("")
+        Static.update(self, "")
+        if self.has_class("panel-open"):
+            self.remove_class("panel-open")
+
+    # ── Toggle ────────────────────────────────────────────────────────────
+
+    def toggle_expand(self) -> None:
+        """Expand or collapse the panel detail view (Ctrl+O)."""
+        self._expanded = not self._expanded
+        self._render()
+
+    # ── Update ─────────────────────────────────────────────────────────────
 
     def update(
         self,
@@ -97,10 +98,10 @@ class TokenPanel(Static):
         cache_pct: float = 0.0,
         total_cost: float = 0.0,
         round: int = 0,
+        msg_count: int = 0,
         context_used: int = 0,
-        context_limit: int = 1_000_000,
+        context_limit: int = 200_000,
     ) -> None:
-        """Update stats from LLM usage events."""
         self.stats.update(
             endpoint=endpoint,
             model=model,
@@ -110,35 +111,113 @@ class TokenPanel(Static):
             cache_pct=cache_pct,
             total_cost=total_cost,
             round=round,
+            msg_count=msg_count,
             context_used=context_used,
             context_limit=context_limit,
         )
         self._render()
 
+    def update_parallel(
+        self,
+        active: bool = False,
+        tasks: list[dict] | None = None,
+        done: int = 0,
+        errors: int = 0,
+    ) -> None:
+        if tasks is not None:
+            self.stats["parallel_tasks"] = tasks
+        self.stats["parallel_active"] = active
+        self.stats["parallel_done"] = done
+        self.stats["parallel_errors"] = errors
+        self._render()
+
+    def update_task_status(
+        self,
+        task_id: str,
+        status: str,  # "running" | "done" | "error"
+        result: str = "",
+    ) -> None:
+        for task in self.stats["parallel_tasks"]:
+            if task.get("id") == task_id:
+                task["status"] = status
+                task["result"] = result[:80]
+                break
+        # Update counts
+        tasks = self.stats["parallel_tasks"]
+        self.stats["parallel_done"] = sum(1 for t in tasks if t.get("status") == "done")
+        self.stats["parallel_errors"] = sum(1 for t in tasks if t.get("status") == "error")
+        self._render()
+
+    # ── Render ─────────────────────────────────────────────────────────────
+
     def _render(self) -> None:
-        """Render the panel content."""
         s = self.stats
-        cp = s["cache_pct"]
-        pct_color = (
-            "panel-good" if cp > 80 else "panel-warn" if cp > 50 else "panel-bad"
-        )
-        cost_str = f"${s['total_cost']:.4f}" if s['total_cost'] else "—"
 
-        self.update_content(
-            f"""\
-[bold]$ DeepX[/bold]
+        if not self._expanded:
+            # Compact: just model + tokens summary
+            cp = s["cache_pct"]
+            cp_cls = "good" if cp > 80 else "warn" if cp > 50 else "bad"
+            cost_str = f"${s['total_cost']:.4f}" if s["total_cost"] else "—"
+            content = (
+                f"[bold]$ DeepX[/bold]\n\n"
+                f"[section-label]Model[/][section-value] {s['model']}\n"
+                f"[section-label]In[/]   [section-value]{s['input_tokens']:,}\n"
+                f"[section-label]Out[/]  [section-value]{s['output_tokens']:,}\n"
+                f"[section-label]Cache[/] [{cp_cls}]{cp:.1f}%[/]\n"
+                f"[section-label]Cost[/]  [section-value]{cost_str}\n"
+            )
+        else:
+            # Expanded: full status
+            cp = s["cache_pct"]
+            cp_cls = "good" if cp > 80 else "warn" if cp > 50 else "bad"
+            cost_str = f"${s['total_cost']:.4f}" if s["total_cost"] else "—"
 
-[.panel-section]
-[.panel-label]Model[.panel-value]  {s['model']}
-[.panel-label]Mode[.panel-value]   {s['endpoint']}
+            context_pct = (
+                s["context_used"] / s["context_limit"] * 100
+                if s["context_limit"] else 0
+            )
+            ctx_cls = "good" if context_pct < 60 else "warn" if context_pct < 85 else "bad"
 
-[dim]─── Tokens ───[/dim]
-[.panel-label]Input[.panel-value]   {s['input_tokens']:,}
-[.panel-label]Output[.panel-value]  {s['output_tokens']:,}
-[.panel-label]Cache[.panel-value]   [{pct_color}]{s['cache_hit']:,}[/]
-[.panel-label]Hit%[.panel-value]    [{pct_color}]{cp:.1f}%[/]
+            content_lines = [
+                "[bold]$ DeepX Status[/bold]",
+                "[divider]────────────────────────────────────[/divider]",
+                f"[section-label]Model[/]    [section-value]{s['model']}",
+                f"[section-label]Mode[/]     [section-value]{s['mode']}",
+                f"[section-label]Round[/]    [section-value]{s['round']}",
+                f"[section-label]Messages[/] [section-value]{s['msg_count']}",
+                f"[section-label]Context[/]  [{ctx_cls}]{context_pct:.0f}%[/] ({s['context_used']:,}/{s['context_limit']:,})",
+                "",
+                f"[section-label]In/Out[/]  [section-value]{s['input_tokens']:,} / {s['output_tokens']:,}",
+                f"[section-label]Cache[/]   [{cp_cls}]{cp:.1f}%[/]",
+                f"[section-label]Cost[/]    [section-value]{cost_str}",
+            ]
 
-[dim]─── Cost ───[/dim]
-[.panel-label]Total[.panel-value]   {cost_str}
-"""
-        )
+            # Parallel tasks section
+            if s["parallel_active"] or s["parallel_tasks"]:
+                tasks = s["parallel_tasks"]
+                if tasks:
+                    total = len(tasks)
+                    done = s["parallel_done"]
+                    err = s["parallel_errors"]
+                    status_icon = "✅" if err == 0 and done == total else "⚠️" if err > 0 else "⏳"
+                    content_lines.append("")
+                    content_lines.append(f"[bold]⏳ Parallel ({status_icon} {done}/{total})[/bold]")
+                    for task in tasks:
+                        tid = task.get("id", "?")
+                        desc = task.get("desc", task.get("description", ""))[:35]
+                        status = task.get("status", "pending")
+                        icon = {"running": "→", "done": "✓", "error": "✗", "pending": "○"}.get(status, "?")
+                        cls = {
+                            "running": "task-running",
+                            "done": "task-done",
+                            "error": "task-error",
+                        }.get(status, "task-running")
+                        result = task.get("result", "")
+                        result_str = f" → {result[:25]}" if result else ""
+                        content_lines.append(f"  [{cls}]{icon}[/] [{tid}] {desc}{result_str}")
+                else:
+                    content_lines.append(f"\n[dim]⏳ Parallel: initializing...[/dim]")
+
+            content = "\n".join(content_lines)
+
+        Static.update(self, content)
