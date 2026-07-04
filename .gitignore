@@ -1,0 +1,28 @@
+# 依赖
+node_modules/
+
+# 构建 / 编译产物
+dist/
+build/
+*.tsbuildinfo
+
+# 测试覆盖率
+coverage/
+
+# 工具与索引缓存（机器本地产物，不入仓）
+.wiscode/
+.codegraph/
+.agent/
+
+# 日志
+*.log
+
+# 环境变量 / 密钥（防泄漏）
+.env
+.env.*
+!.env.example
+
+# 操作系统 / 编辑器
+.DS_Store
+.idea/
+.vscode/
