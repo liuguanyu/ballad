@@ -28,6 +28,8 @@ AGENTS.md（铁律） > specs/*.spec.md（功能需求） > 代码
 | [tui-clipboard.spec.md](./tui-clipboard.spec.md) | 剪贴板粘贴：Ctrl+V 文本/图片，跨平台 CLI 桥接，图片写 .agent/temp/ |
 | [tui-shimmer.spec.md](./tui-shimmer.spec.md) | 流光文字：微光扫过文字（cc 思考态呼吸感）+ 可选 spinner；组件/hook/纯逻辑三层 |
 | [state-management.spec.md](./state-management.spec.md) | 状态管理决策：当前不引库，useReducer / view store 的触发线 |
+| [core-provider.spec.md](./core-provider.spec.md) | 真实模型接入层：按 wire protocol 分适配器（anthropic/openai-v1/openai-v2/mock）、多模型注册表、配置路由、无 key 回落 mock |
+| [core-agent.spec.md](./core-agent.spec.md) | Agent 内核：LangGraph 图状态机 + tool-call（read/write/bash/query）+ Self-correction + Time-Travel；契约加 tool_call/tool_result 事件，Brain 签名不变 |
 
 ## 编写约定
 

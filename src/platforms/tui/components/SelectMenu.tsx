@@ -4,13 +4,13 @@
  * 职责单一：只把「过滤后的 items + 菜单状态」映射为视图，不持有状态、不含 useInput——
  * 键盘由 App/DynamicInput 驱动（命令模式让渡）。slash command / MCP list 等复用同一组件。
  *
- * 视觉（贴合 cc / reasonix 截图）：最多 MENU_WINDOW 行，高亮行整行反白，
- * 每行 `label  hint`；底部一条提示栏 `↑/↓ 移动 · Enter 选中 · Esc 关闭`。
+ * 视觉（贴合 cc / reasonix 截图）：最多 MENU_WINDOW 行，高亮行用主题色（theme.selected）
+ * 前景着色（非反白），每行 `label  hint`；底部一条提示栏 `↑/↓ 移动 · Enter 选中 · Esc 关闭`。
  * 空 items 由上层决定不挂载，本组件对空 items 返回空盒子以防御。
  */
 import React from 'react';
 import { Box, Text } from 'ink';
-import { theme, textStyle } from '../theme.ts';
+import { theme } from '../theme.ts';
 import {
   visibleWindow,
   type MenuItem,
@@ -37,7 +37,7 @@ export function SelectMenu({ items, state }: SelectMenuProps): React.ReactElemen
         return (
           <Box key={item.value}>
             {active ? (
-              <Text {...textStyle.selected}>{` ${line} `}</Text>
+              <Text color={theme.selected}>{` ${line} `}</Text>
             ) : (
               <Text color={theme.muted}>{` ${line} `}</Text>
             )}

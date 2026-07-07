@@ -42,8 +42,8 @@ export const glyph = {
  * 文本效果（非颜色）：直接展开到 <Text {...textStyle.xxx}>。
  * 收口 inverse/bold/underline 等布尔样式，让"高亮该长什么样"只在此处决定。
  * userEcho = 用户消息回显的高亮锚点（当前用反白，将来可换 bold+背景色而不动组件）。
+ * 注：选择框高亮已改为主题色前景（theme.selected），不再用反白，故此处不再有 selected 样式。
  */
 export const textStyle = {
   userEcho: { inverse: true },
-  selected: { inverse: true }, // 选择框高亮行（命令菜单 / MCP list）整行反白
 } as const satisfies Record<string, Partial<TextProps>>;

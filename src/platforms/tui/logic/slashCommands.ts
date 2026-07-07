@@ -18,6 +18,7 @@ export interface SlashCommand extends MenuItem {
 /** 命令注册表（有序，即菜单展示顺序）。 */
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { value: 'exit', label: '/exit', hint: '退出 ballad' },
+  { value: 'model', label: '/model', hint: '切换模型' },
 ];
 
 /**

@@ -63,6 +63,40 @@ describe('AgentEventSchema', () => {
     }
   });
 
+  test('tool_call 事件携带工具名/参数/callId（REQ-GRAPH-2）', () => {
+    const ev = AgentEventSchema.parse({
+      type: 'tool_call',
+      tool: 'read_file',
+      args: { path: 'foo.ts' },
+      callId: 'c1',
+    });
+    if (ev.type === 'tool_call') {
+      expect(ev.tool).toBe('read_file');
+      expect(ev.args['path']).toBe('foo.ts');
+      expect(ev.callId).toBe('c1');
+    }
+  });
+
+  test('tool_result 事件携带 ok/summary（REQ-GRAPH-2）', () => {
+    const ev = AgentEventSchema.parse({
+      type: 'tool_result',
+      tool: 'read_file',
+      callId: 'c1',
+      ok: false,
+      summary: '解析失败',
+    });
+    if (ev.type === 'tool_result') {
+      expect(ev.ok).toBe(false);
+      expect(ev.summary).toBe('解析失败');
+    }
+  });
+
+  test('tool_call 缺 callId 被拒', () => {
+    expect(() =>
+      AgentEventSchema.parse({ type: 'tool_call', tool: 'read_file', args: {} }),
+    ).toThrow();
+  });
+
   test('判别联合：未知 type 被拒', () => {
     expect(() => AgentEventSchema.parse({ type: 'boom' })).toThrow();
   });

@@ -26,10 +26,12 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
    * 大脑正在推理、尚未吐出正文（reasoning / thinking 阶段）。
    * 表现层据此显示"思考中"微光提示；收到第一个 token 即结束思考态。
    * 独立于正文的语义通道——对齐真实模型的 thinking/reasoning 分离。
+   * text 字段承载实际思考文本（可选，向后兼容），TUI 可折叠展示。
    */
   z.object({
     type: z.literal('thinking'),
     label: z.string().optional(),
+    text: z.string().optional(),
   }),
   /** 流式思考 / 正文 token（高帧率吐字）。 */
   z.object({
@@ -41,6 +43,29 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     type: z.literal('code_stream'),
     language: z.string(),
     text: z.string(),
+  }),
+  /**
+   * 工具调用：模型决定调某工具（Phase 2b）。
+   * args 是经工具 Zod schema 校验后的参数（execute 节点调用前校验）。
+   * callId 用于配对后续的 tool_result（自愈时模型可见对应错误）。
+   */
+  z.object({
+    type: z.literal('tool_call'),
+    tool: z.string(),
+    args: z.record(z.string(), z.unknown()),
+    callId: z.string(),
+  }),
+  /**
+   * 工具结果：执行完的摘要（Phase 2b）。
+   * ok=false 时 summary 是错误信息，回喂模型触发 Self-correction。
+   * 不带完整 diff——2c 加 diff 视图时可扩可选字段（如 diff?: string），不破坏契约。
+   */
+  z.object({
+    type: z.literal('tool_result'),
+    tool: z.string(),
+    callId: z.string(),
+    ok: z.boolean(),
+    summary: z.string(),
   }),
   /** 一次助手回复结束，可携带本轮 token 用量。 */
   z.object({

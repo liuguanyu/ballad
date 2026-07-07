@@ -53,6 +53,12 @@ interface DynamicInputProps {
    * 由 App 注入 clipboard service；返回空串则忽略。
    */
   readonly onPaste?: () => Promise<string>;
+  /**
+   * 外部强制清空信号：值变化时清空内部 value（如 /model 选中后清掉 slash command）。
+   * 不传则不生效；DynamicInput 的 value 是内部状态机独占，App 改镜像无法反向推回，
+   * 故用此信号触发清空。用 number 而非 boolean，每次递增即触发一次。
+   */
+  readonly resetSignal?: number;
 }
 
 export function DynamicInput({
@@ -66,9 +72,17 @@ export function DynamicInput({
   onCancel,
   onValueChange,
   onPaste,
+  resetSignal,
 }: DynamicInputProps): React.ReactElement {
   // 单一状态源：value 与历史翻阅态合并在 HistoryState 里（见 spec）。
   const [state, setState] = useState<HistoryState>(() => idleHistoryState());
+
+  // 外部清空信号：resetSignal 变化时清空 value（/model 选中后清掉 slash command）。
+  useEffect(() => {
+    if (resetSignal !== undefined && resetSignal > 0) {
+      setState(idleHistoryState());
+    }
+  }, [resetSignal]);
   const { value, browsing } = state;
 
   // 把 value 变化镜像给 App，用于计算命令模式与菜单过滤（副作用集中一处，

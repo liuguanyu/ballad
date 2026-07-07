@@ -35,6 +35,13 @@ describe('SLASH_COMMANDS 注册表', () => {
     expect(exit?.hint.length).toBeGreaterThan(0);
   });
 
+  test('含 /model 且形状完整', () => {
+    const model = SLASH_COMMANDS.find((c) => c.value === 'model');
+    expect(model).toBeDefined();
+    expect(model?.label).toBe('/model');
+    expect(model?.hint.length).toBeGreaterThan(0);
+  });
+
   test('label 均以 / 开头', () => {
     for (const c of SLASH_COMMANDS) {
       expect(c.label.startsWith('/')).toBe(true);

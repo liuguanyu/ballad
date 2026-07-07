@@ -128,6 +128,119 @@ describe('App 集成 · Slash 命令（REQ-CMD-1/2/6）', () => {
     expect(brainCalled).toBe(false);
   });
 
+  test('选中 /model 呼出模型列表（REQ-CMD-7）', async () => {
+    const models = [
+      { name: 'glm', label: 'glm', hint: 'openai-v1 · glm-5.2' },
+      { name: 'deepseek', label: 'deepseek', hint: 'openai-v1 · deepseek-v4' },
+    ];
+    const { stdin, lastFrame } = render(
+      React.createElement(App, {
+        brain: makeFakeBrain('x'),
+        cwd: '/demo',
+        availableModels: models,
+        onSwitchModel: () => makeFakeBrain('switched'),
+      }),
+    );
+    await typeText(stdin, '/model');
+    stdin.write('\r'); // 选中 /model → 进入模型选择模式
+    await flush(80);
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('glm');
+    expect(frame).toContain('deepseek');
+  });
+
+  test('切换模型后 Header 同步显示新模型名（REQ-CMD-7）', async () => {
+    const models = [
+      { name: 'glm', label: 'glm', hint: 'openai-v1' },
+      { name: 'deepseek', label: 'deepseek', hint: 'openai-v1' },
+    ];
+    const { stdin, lastFrame } = render(
+      React.createElement(App, {
+        brain: makeFakeBrain('x'),
+        cwd: '/demo',
+        availableModels: models,
+        activeModel: 'glm',
+        onSwitchModel: () => makeFakeBrain('switched'),
+      }),
+    );
+    expect(lastFrame() ?? '').toContain('model: glm');
+    await typeText(stdin, '/model');
+    stdin.write('\r'); // 进模型菜单
+    await flush(80);
+    stdin.write('\x1b[B'); // 下键 → 高亮 deepseek
+    await flush(80);
+    stdin.write('\r'); // 选中
+    await flush(80);
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('model: deepseek'); // Header 已同步
+    expect(frame).not.toContain('model: glm');
+    expect(frame).not.toContain('/model'); // slash command 已被清空（resetSignal）
+    expect(frame).not.toContain('Esc 关闭'); // 命令菜单也不再因 /model 重新弹出
+  });
+
+  test('在模型列表中选中某 model 触发 onSwitchModel（REQ-CMD-7）', async () => {
+    const models = [
+      { name: 'glm', label: 'glm', hint: 'openai-v1' },
+      { name: 'deepseek', label: 'deepseek', hint: 'openai-v1' },
+    ];
+    const switched: string[] = [];
+    const { stdin } = render(
+      React.createElement(App, {
+        brain: makeFakeBrain('x'),
+        cwd: '/demo',
+        availableModels: models,
+        onSwitchModel: (name: string) => {
+          switched.push(name);
+          return makeFakeBrain('switched');
+        },
+      }),
+    );
+    await typeText(stdin, '/model');
+    stdin.write('\r'); // 进模型菜单
+    await flush(80);
+    stdin.write('\r'); // 选中第一个（glm）
+    await flush(80);
+    expect(switched).toEqual(['glm']);
+  });
+
+  test('Esc 关闭模型列表（REQ-CMD-7）', async () => {
+    const models = [
+      { name: 'glm', label: 'glm', hint: 'openai-v1' },
+      { name: 'deepseek', label: 'deepseek', hint: 'openai-v1' },
+    ];
+    const { stdin, lastFrame } = render(
+      React.createElement(App, {
+        brain: makeFakeBrain('x'),
+        cwd: '/demo',
+        availableModels: models,
+        onSwitchModel: () => makeFakeBrain('x'),
+      }),
+    );
+    await typeText(stdin, '/model');
+    stdin.write('\r'); // 进模型菜单
+    await flush(80);
+    expect(lastFrame() ?? '').toContain('glm');
+    stdin.write('\x1b'); // Esc
+    await flush(80);
+    expect(lastFrame() ?? '').not.toContain('Esc 关闭'); // 模型菜单关闭后提示栏消失
+  });
+
+  test('不传 availableModels 时 /model 选中无副作用（向后兼容）', async () => {
+    let brainCalled = false;
+    const brain: Brain = async function* () {
+      brainCalled = true;
+      yield { type: 'message_start', role: 'assistant' };
+    };
+    const { stdin } = render(
+      React.createElement(App, { brain, cwd: '/demo' }),
+    );
+    await typeText(stdin, '/model');
+    stdin.write('\r');
+    await flush(80);
+    // 无 availableModels：不弹模型菜单，不崩，brain 未被调用（命令不进对话流）
+    expect(brainCalled).toBe(false);
+  });
+
   test("删掉 '/' 后菜单消失", async () => {
     const { stdin, lastFrame } = render(
       React.createElement(App, { brain: makeFakeBrain('x'), cwd: '/demo' }),
@@ -256,5 +369,56 @@ describe('App 集成 · 思考态流光（thinking 事件）', () => {
     const doneFrame = lastFrame() ?? '';
     expect(doneFrame).toContain('answer'); // 正文到达
     expect(doneFrame).not.toContain('正在推理'); // 思考态已消失
+  });
+
+  test('大脑不发 thinking 事件时，提交后也默认显示"思考中"流光（真实模型场景）', async () => {
+    // openai-v1 等协议全程不产 thinking 事件；等待期消息流里必须有反馈。
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const brain: Brain = async function* noThinkingBrain() {
+      yield { type: 'message_start', role: 'assistant' };
+      await gate; // 模拟真实模型的静默等待期（无 thinking 事件）
+      yield { type: 'token', text: 'late-answer' };
+      yield { type: 'message_end', usage: { inputTokens: 1, outputTokens: 1 } };
+    };
+    const { stdin, lastFrame } = render(
+      React.createElement(App, { brain, cwd: '/demo' }),
+    );
+    await typeText(stdin, 'q');
+    stdin.write('\r');
+    await flush(60);
+    expect(lastFrame() ?? '').toContain('思考中'); // 默认流光在位
+    release();
+    await flush(80);
+    const doneFrame = lastFrame() ?? '';
+    expect(doneFrame).toContain('late-answer');
+    expect(doneFrame).not.toContain('思考中'); // 首个 token 后消失
+  });
+
+  test('流光固定在输入框上横线正上方，并在持续后显示读秒', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const brain: Brain = async function* thinkBrain() {
+      yield { type: 'message_start', role: 'assistant' };
+      yield { type: 'thinking', label: '正在推理' };
+      await gate;
+      yield { type: 'token', text: 'done' };
+      yield { type: 'message_end', usage: { inputTokens: 1, outputTokens: 1 } };
+    };
+    const { stdin, lastFrame } = render(
+      React.createElement(App, { brain, cwd: '/demo' }),
+    );
+    await typeText(stdin, 'q');
+    stdin.write('\r');
+    await flush(1200);
+    const lines = (lastFrame() ?? '').split('\n');
+    const thinkIdx = lines.findIndex((l) => l.includes('正在推理'));
+    const inputTopIdx = lines.findIndex((l) => l.includes('─'.repeat(8)));
+    expect(thinkIdx).toBeGreaterThan(-1);
+    expect(inputTopIdx).toBeGreaterThan(-1);
+    expect(inputTopIdx - thinkIdx).toBe(1); // thinking 贴在输入框顶线正上方
+    expect(lines[thinkIdx]).toContain('1s');
+    release();
+    await flush(80);
   });
 });
